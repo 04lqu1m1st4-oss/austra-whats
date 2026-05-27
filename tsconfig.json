@@ -5,11 +5,11 @@
     "lib": ["ES2020"],
     "outDir": "./dist",
     "rootDir": "./",
-    "strict": true,
+    "strict": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["worker.ts"],
+  "include": ["worker-whatsapp.ts"],
   "exclude": ["node_modules", "dist"]
 }
