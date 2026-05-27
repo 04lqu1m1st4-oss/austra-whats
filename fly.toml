@@ -1,0 +1,21 @@
+app = "telegram-dispatch-worker"
+primary_region = "ams"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+# Secrets (setar via CLI — nunca no fly.toml):
+#   fly secrets set NEXT_PUBLIC_SUPABASE_URL=...
+#   fly secrets set SUPABASE_SERVICE_ROLE_KEY=...
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Sem HTTP server — worker puro, sem health check HTTP
+# O Fly monitora o processo pelo PID; se cair, reinicia automaticamente
+[processes]
+  app = "node dist/worker.js"
