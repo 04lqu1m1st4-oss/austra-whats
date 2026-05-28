@@ -30,6 +30,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  initAuthCreds,
   isJidGroup,
   proto,
   WASocket,
@@ -252,7 +253,7 @@ async function useSupabaseAuthState(account: WaAccount): Promise<SupabaseAuthSta
   const keyStore: Record<string, Record<string, unknown>> = (data.keys as any) ?? {};
 
   const state: AuthenticationState = {
-    creds: (data.creds as any) ?? ({} as any),
+    creds: (data.creds as any) ?? initAuthCreds(),
     keys: {
       get: (type: string, ids: string[]) => {
         const dict: Record<string, unknown> = {};
@@ -394,19 +395,22 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
     });
 
     // Aguarda conexão estabelecida (timeout 30s)
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("CONNECT_TIMEOUT_30s")), 30_000);
+    // Contas sem creds precisam escanear QR primeiro — não espera socketReady
+    if (account.creds_json) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("CONNECT_TIMEOUT_30s")), 30_000);
 
-      const check = () => {
-        if (socketReady.get(account.id)) {
-          clearTimeout(timeout);
-          resolve();
-        } else {
-          setTimeout(check, 100);
-        }
-      };
-      check();
-    });
+        const check = () => {
+          if (socketReady.get(account.id)) {
+            clearTimeout(timeout);
+            resolve();
+          } else {
+            setTimeout(check, 100);
+          }
+        };
+        check();
+      });
+    }
 
     return sock;
   })();
@@ -1219,17 +1223,29 @@ const httpServer = http.createServer(async (req, res) => {
     const account = row as WaAccount;
     accountCache.set(accountId, account);
 
-    if (!account.is_active || !account.creds_json) {
-      return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa ou sem creds" });
+    if (!account.is_active) {
+      return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa" });
+    }
+
+    // Derruba socket anterior se existir
+    const old = sockets.get(accountId);
+    if (old) {
+      try { old.end(undefined); } catch {}
+      sockets.delete(accountId);
+      socketReady.set(accountId, false);
+    }
+
+    if (!account.creds_json) {
+      // Conta nova sem creds: inicia socket em background para gerar QR.
+      // getSocket() não bloqueia para contas sem creds (ver lógica acima).
+      getSocket(account).catch(err =>
+        console.warn(`[reload] Falha ao iniciar QR para ${account.phone_number}: ${err.message}`)
+      );
+      console.log(`[http] /reload → QR iniciado para ${account.phone_number}`);
+      return jsonResponse(res, 200, { ok: true, qr_pending: true });
     }
 
     try {
-      const old = sockets.get(accountId);
-      if (old) {
-        try { old.end(undefined); } catch {}
-        sockets.delete(accountId);
-        socketReady.set(accountId, false);
-      }
       await getSocket(account);
       console.log(`[http] /reload ✓ ${account.phone_number}`);
       return jsonResponse(res, 200, { ok: true });
