@@ -1,21 +1,26 @@
 {
-  "name": "whatsapp-dispatch-worker",
+  "name": "zap-dispatch-worker",
   "version": "1.0.0",
   "private": true,
   "scripts": {
     "build": "tsc",
-    "start": "node dist/worker-whatsapp.js",
-    "dev": "tsx worker-whatsapp.ts"
+    "start:telegram": "node dist/worker.js",
+    "start:whatsapp": "node dist/worker-whatsapp.js",
+    "dev:telegram": "ts-node worker.ts",
+    "dev:whatsapp": "ts-node worker-whatsapp.ts"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.39.0",
     "@whiskeysockets/baileys": "^6.7.9",
-    "pino": "^9.0.0"
+    "node-cron": "^3.0.3",
+    "pino": "^9.5.0",
+    "telegram": "^2.19.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "tsx": "^4.7.0",
+    "@types/node-cron": "^3.0.11",
+    "ts-node": "^10.9.2",
     "typescript": "^5.3.0"
   }
 }
