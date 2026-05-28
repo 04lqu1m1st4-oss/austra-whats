@@ -13,8 +13,6 @@
 //   5. JID: grupos WA usam formato "120363XXXXXXXXXX@g.us"
 //   6. Sem grupos "abertos" por enquanto — MVP foca em grupos fechados (horário fixo)
 //
-// Fix/Opt versionados igual ao Telegram para rastreabilidade futura.
-//
 // v1 (initial):
 //   Sniper loop para grupos fechados com timing calibrável
 //   Dedup via cycle_message_id no banco (anti-duplicata em retry)
@@ -23,25 +21,26 @@
 //   Pre-fetch do schedule 800ms antes do disparo
 //   Backoff exponencial no retry (3s → 6s → 12s → max 15s)
 //   HTTP server na porta 3002 (não conflita com Telegram na 3001)
+//
+// v2 (fixes):
+//   QR convertido para PNG base64 antes de salvar no banco (fix: frontend não renderizava)
+//   getSocket não bloqueia em socketReady para contas sem creds (fix: timeout 30s em novas contas)
+//   /reload inicia QR para contas novas sem creds (fix: retornava skipped sem iniciar sessão)
+//   initAuthCreds importado e usado corretamente na inicialização de sessão
 
 import { createClient }                      from "@supabase/supabase-js";
 import makeWASocket, {
-  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   initAuthCreds,
-  isJidGroup,
-  proto,
   WASocket,
   AuthenticationState,
-  SignalKeyStoreWithTransaction,
 }                                             from "@whiskeysockets/baileys";
 import { Boom }                               from "@hapi/boom";
 import P                                      from "pino";
 import http                                   from "http";
 import { randomUUID }                         from "crypto";
-import { EventEmitter }                       from "events";
 import QRCode                                 from "qrcode";
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -58,28 +57,22 @@ const supabase = createClient(
 const WORKER_PORT              = parseInt(process.env.PORT ?? "3002", 10);
 const WORKER_SECRET            = process.env.WORKER_SECRET ?? "";
 
-// Timing — calibrar com logs [sniper][timing] após primeiros disparos.
-// WA RTT Railway US East → servidores WA: estimativa inicial ~60-80ms one-way.
-// SNIPER_BEFORE_MS cobre: RTT + event loop lag Node (~10-20ms) + margem (~20ms).
-// Se logs "vs horário" ficarem sempre negativos por muito: reduzir.
-// Se ficarem positivos: aumentar.
 const SNIPER_BEFORE_MS              = 120;
 const SNIPER_SEND_TIMEOUT_MS        = 1_500;
-const SNIPER_ATTEMPT_INTERVAL_MS    = 2;   // mais conservador que Telegram (protocolo mais pesado)
+const SNIPER_ATTEMPT_INTERVAL_MS    = 2;
 const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 5;
 const SNIPER_BUDGET_MS              = 50_000;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
-const PREFETCH_BEFORE_MS    = 800;
-const RELOAD_INTERVAL_MS    = 30_000;
-const LOOKAHEAD_MS          = 2 * 60 * 1_000;
-const RETRY_BUDGET_MS       = 50_000;
-const SEND_TIMEOUT_MS       = 15_000;
+const PREFETCH_BEFORE_MS        = 800;
+const RELOAD_INTERVAL_MS        = 30_000;
+const LOOKAHEAD_MS              = 2 * 60 * 1_000;
+const RETRY_BUDGET_MS           = 50_000;
+const SEND_TIMEOUT_MS           = 15_000;
 const SEND_RETRY_BACKOFF_MAX_MS = 15_000;
 
-// Baileys logger silencioso em prod — troca para "debug" se precisar diagnosticar
 const logger = P({ level: process.env.WA_LOG_LEVEL ?? "silent" });
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -136,22 +129,14 @@ interface DispatchResult {
 /* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
    ───────────────────────────────────────────────────────────────────────────── */
-
-// socket Baileys por account
 const sockets               = new Map<string, WASocket>();
-// status de conexão por account
 const socketReady           = new Map<string, boolean>();
-// promise em andamento de conexão (mutex, igual connectingPromises do Telegram)
 const connectingPromises    = new Map<string, Promise<WASocket>>();
-// cache de contas
 const accountCache          = new Map<string, WaAccount>();
-// cache de schedules pré-carregados
 const schedulePrefetchCache = new Map<string, WaSchedule>();
-// timers
 const scheduledTimers       = new Map<string, ReturnType<typeof setTimeout>>();
 const prefetchTimers        = new Map<string, ReturnType<typeof setTimeout>>();
 const sniperTimers          = new Map<string, ReturnType<typeof setTimeout>>();
-// guards de duplo disparo
 const firingNow             = new Set<string>();
 const sniperFiringNow       = new Set<string>();
 
@@ -174,7 +159,6 @@ const SCHEDULE_SELECT = `
 /* ─────────────────────────────────────────────────────────────────────────────
    HELPERS PUROS
    ───────────────────────────────────────────────────────────────────────────── */
-
 function isRetryableError(msg: string): boolean {
   const u = msg.toUpperCase();
   return !u.includes("LOGGED_OUT") &&
@@ -229,31 +213,25 @@ function isRetryDue(schedule: WaSchedule, now: Date): boolean {
 /* ─────────────────────────────────────────────────────────────────────────────
    SESSÃO BAILEYS — SUPABASE COMO STORAGE
    
-   Baileys espera um objeto AuthenticationState com creds + keys.
-   Normalmente usaria useMultiFileAuthState (salva em disco).
-   Aqui implementamos um adapter que lê/escreve no Supabase.
-   
    Estrutura salva em wa_accounts.creds_json:
    {
-     creds: { ... },        // credenciais principais
-     keys: { ... }          // signal keys (pré-keys, sessions, etc)
+     creds: { ... },   // credenciais principais
+     keys:  { ... }    // signal keys (pré-keys, sessions, etc)
    }
    ───────────────────────────────────────────────────────────────────────────── */
-
 interface SupabaseAuthState {
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
 }
 
 async function useSupabaseAuthState(account: WaAccount): Promise<SupabaseAuthState> {
-  let data: { creds?: Record<string, unknown>; keys?: Record<string, unknown> } =
+  const data: { creds?: Record<string, unknown>; keys?: Record<string, unknown> } =
     (account.creds_json as any) ?? {};
 
-  // Usa memória como store de keys durante a sessão
-  // Persiste no Supabase apenas quando saveCreds é chamado
   const keyStore: Record<string, Record<string, unknown>> = (data.keys as any) ?? {};
 
   const state: AuthenticationState = {
+    // FIX v2: usa initAuthCreds() em vez de {} as any para garantir estrutura correta
     creds: (data.creds as any) ?? initAuthCreds(),
     keys: {
       get: (type: string, ids: string[]) => {
@@ -289,11 +267,8 @@ async function useSupabaseAuthState(account: WaAccount): Promise<SupabaseAuthSta
     if (error) {
       console.error(`[creds] Falha ao salvar creds de ${account.phone_number}:`, error.message);
     } else {
-      // Atualiza cache local
       const cached = accountCache.get(account.id);
-      if (cached) {
-        cached.creds_json = payload as any;
-      }
+      if (cached) cached.creds_json = payload as any;
     }
   };
 
@@ -303,7 +278,6 @@ async function useSupabaseAuthState(account: WaAccount): Promise<SupabaseAuthSta
 /* ─────────────────────────────────────────────────────────────────────────────
    GERENCIAMENTO DE CONEXÕES BAILEYS
    ───────────────────────────────────────────────────────────────────────────── */
-
 async function getSocket(account: WaAccount): Promise<WASocket> {
   const existing = sockets.get(account.id);
   if (existing && socketReady.get(account.id)) return existing;
@@ -312,7 +286,6 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
   if (inflight) return inflight;
 
   const connectPromise = (async () => {
-    // Derruba socket anterior se existir
     const old = sockets.get(account.id);
     if (old) {
       try { old.end(undefined); } catch {}
@@ -331,27 +304,25 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
         creds: state.creds,
         keys:  makeCacheableSignalKeyStore(state.keys as any, logger),
       },
-      browser:           ["SenhaBaixa", "Chrome", "1.0.0"],
-      connectTimeoutMs:  30_000,
+      browser:             ["SenhaBaixa", "Chrome", "1.0.0"],
+      connectTimeoutMs:    30_000,
       keepAliveIntervalMs: 30_000,
       retryRequestDelayMs: 250,
-      maxMsgRetryCount:  3,
-      getMessage: async () => undefined,  // não precisamos do histórico
+      maxMsgRetryCount:    3,
+      getMessage: async () => undefined,
     });
 
     sockets.set(account.id, sock);
     socketReady.set(account.id, false);
 
-    // Evento: creds atualizadas → persiste no Supabase
     sock.ev.on("creds.update", saveCreds);
 
-    // Evento: estado da conexão
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // QR gerado = sessão nova ou expirada
-        // Converte string bruta do Baileys para PNG base64 e salva no banco
+        // FIX v2: converte string bruta do Baileys para PNG base64 antes de salvar
+        // O frontend espera data:image/png;base64,... — sem isso a imagem não renderiza
         console.log(`[connect] QR gerado para ${account.phone_number} — convertendo para PNG e salvando`);
         try {
           const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
@@ -386,26 +357,22 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
           return;
         }
 
-        // Outros motivos: tenta reconectar após 3s
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        if (shouldReconnect) {
-          console.warn(`[connect] Desconectado (${statusCode}) — reconectando em 3s: ${account.phone_number}`);
-          setTimeout(() => {
-            const freshAccount = accountCache.get(account.id) ?? account;
-            getSocket(freshAccount).catch(err =>
-              console.error(`[connect] Falha na reconexão de ${account.phone_number}:`, err.message)
-            );
-          }, 3_000);
-        }
+        console.warn(`[connect] Desconectado (${statusCode}) — reconectando em 3s: ${account.phone_number}`);
+        setTimeout(() => {
+          const freshAccount = accountCache.get(account.id) ?? account;
+          getSocket(freshAccount).catch(err =>
+            console.error(`[connect] Falha na reconexão de ${account.phone_number}:`, err.message)
+          );
+        }, 3_000);
       }
     });
 
-    // Aguarda conexão estabelecida (timeout 30s)
-    // Contas sem creds precisam escanear QR primeiro — não espera socketReady
-    if (account.creds_json) {
+    // FIX v2: só bloqueia esperando socketReady se a conta JÁ TEM creds salvas.
+    // Contas novas (sem creds) precisam escanear QR primeiro — não há como ficar "ready"
+    // antes do scan, então não esperamos: o socket fica em background gerando o QR.
+    if (account.creds_json && !(account.creds_json as any).qr) {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("CONNECT_TIMEOUT_30s")), 30_000);
-
         const check = () => {
           if (socketReady.get(account.id)) {
             clearTimeout(timeout);
@@ -431,8 +398,6 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ENVIO COM RETRY INTERNO
-   Anti-duplicata: cycle_message_id é gerado UMA vez por ciclo e checado no banco
-   antes de cada tentativa. Se já existe log sent com esse ID + account → pula.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   sock: WASocket,
@@ -481,8 +446,7 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER SEND — envio único com timeout curto (sem retry interno)
-   cycleMessageId passado como parâmetro — gerado uma vez no loop do sniper
+   SNIPER SEND
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperSendOnce(
   sock: WASocket,
@@ -498,7 +462,7 @@ async function sniperSendOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DEDUP — busca quem já enviou neste ciclo
+   DEDUP
    ───────────────────────────────────────────────────────────────────────────── */
 async function getAlreadySentIds(schedule: WaSchedule): Promise<Set<string>> {
   const cycleStart = schedule.retry_until
@@ -523,10 +487,6 @@ async function getAlreadySentIds(schedule: WaSchedule): Promise<Set<string>> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
-   Mesma estrutura do Telegram:
-   Fase 1: loop agressivo na 1ª conta até o grupo abrir
-   Fase 2: demais contas em sequência com delay mínimo
-   Fase 3: atualiza schedule no banco
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -559,7 +519,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as WaSchedule;
     }
 
-    // Logs de timing para calibração (igual v7 do Telegram)
     const scheduledAt     = new Date(schedule.next_run_at).getTime();
     const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
     const timerLagMs      = sniperEnteredAt - plannedSniperAt;
@@ -571,7 +530,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Atualiza membros do cache
     if (group.wa_group_members) {
       group.wa_group_members = group.wa_group_members.map(m => ({
         ...m,
@@ -588,12 +546,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    const jid       = group.wa_chat_id;
-    const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
+    const jid            = group.wa_chat_id;
+    const budgetEnd      = Date.now() + SNIPER_BUDGET_MS;
     const results: DispatchResult[] = [];
-
-    // cycleMessageId: UUID único por ciclo de disparo
-    // Usado como chave de dedup no banco — reutilizado em todos os retries do ciclo
     const cycleMessageId = randomUUID();
 
     console.log(`[sniper] 🎯 Iniciando loop para schedule ${scheduleId} — ${members.length} conta(s) | cycle: ${cycleMessageId}`);
@@ -629,13 +584,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         await sniperSendOnce(firstSock, jid, firstText);
         firstSentAt = new Date();
 
-        // Logs de timing para calibração
         const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
         const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
         console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms`);
-        console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
-
+        console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms tentativa=${attempt}`);
         console.log(`[sniper] ✓ ${firstAccount.phone_number} enviou na tentativa ${attempt}`);
+
         results.push({
           account_id:   firstAccount.id,
           message_text: firstMember.message_text,
@@ -646,7 +600,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       } catch (err: any) {
         const errMsg = String(err?.message ?? "");
-
         const isFatal =
           errMsg.includes("LOGGED_OUT") ||
           errMsg.includes("BANNED")     ||
@@ -673,7 +626,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       }
     }
 
-    // Log da primeira conta em background
     supabase.from("wa_dispatch_logs").insert({
       user_id:             schedule.user_id,
       group_id:            group.id,
@@ -704,7 +656,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── FASE 2: demais contas em sequência ───────────────────────────────
+    // ── FASE 2: demais contas ────────────────────────────────────────────
     for (let i = 1; i < members.length; i++) {
       await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
 
@@ -719,22 +671,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         await sniperSendOnce(sock, jid, text);
         sentAt = new Date();
         console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "sent",
-          retryable:    false,
-        });
+        results.push({ account_id: account.id, message_text: member.message_text, status: "sent", retryable: false });
       } catch (err: any) {
         error = String(err?.message ?? "");
         console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "failed",
-          retryable:    isRetryableError(error),
-          error,
-        });
+        results.push({ account_id: account.id, message_text: member.message_text, status: "failed", retryable: isRetryableError(error), error });
       }
 
       supabase.from("wa_dispatch_logs").insert({
@@ -755,20 +696,18 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       });
     }
 
-    // ── FASE 3: atualiza schedule ─────────────────────────────────────────
+    // ── FASE 3: atualiza schedule ────────────────────────────────────────
     await updateScheduleAfterDispatch(schedule, results, firstSentAt, cycleMessageId);
 
   } finally {
     sniperFiringNow.delete(scheduleId);
-
-    // Bloqueia o fireSchedule do mesmo ciclo (igual BUG #A do Telegram)
     firingNow.add(scheduleId);
     setTimeout(() => firingNow.delete(scheduleId), SNIPER_DONE_BLOCK_TTL_MS);
   }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DESPACHO GENÉRICO (retry via banco, boot tardio, etc.)
+   DESPACHO GENÉRICO
    ───────────────────────────────────────────────────────────────────────────── */
 async function dispatchToGroup(
   schedule: WaSchedule,
@@ -786,12 +725,7 @@ async function dispatchToGroup(
 
     if (alreadySent.has(account.id)) {
       console.log(`[dispatch] ↷ ${account.phone_number} — já enviou neste ciclo`);
-      return {
-        account_id:   account.id,
-        message_text: member.message_text,
-        status:       "skipped" as const,
-        retryable:    false,
-      };
+      return { account_id: account.id, message_text: member.message_text, status: "skipped" as const, retryable: false };
     }
 
     let status: "sent" | "failed" = "failed";
@@ -832,7 +766,7 @@ async function dispatchToGroup(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ATUALIZAÇÃO DO SCHEDULE APÓS DISPARO
+   ATUALIZAÇÃO DO SCHEDULE
    ───────────────────────────────────────────────────────────────────────────── */
 async function updateScheduleAfterDispatch(
   schedule: WaSchedule,
@@ -840,16 +774,14 @@ async function updateScheduleAfterDispatch(
   now: Date,
   cycleMessageId: string
 ): Promise<void> {
-  const nowISO = now.toISOString();
-
+  const nowISO         = now.toISOString();
   const sentCount      = results.filter(r => r.status === "sent").length;
   const skippedCount   = results.filter(r => r.status === "skipped").length;
   const retryableFails = results.filter(r => r.status === "failed" && r.retryable);
   const permanentFails = results.filter(r => r.status === "failed" && !r.retryable);
 
-  const hasActiveMembers = results.length > 0;
   const allOk =
-    hasActiveMembers &&
+    results.length > 0 &&
     retryableFails.length === 0 &&
     permanentFails.length === 0 &&
     (sentCount + skippedCount) > 0;
@@ -914,7 +846,7 @@ async function updateScheduleAfterDispatch(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   FIRE SCHEDULE (fallback — retry via banco, boot tardio)
+   FIRE SCHEDULE
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -1097,17 +1029,14 @@ async function reloadSchedules(): Promise<void> {
       .lte("retry_until", nowISO),
   ]);
 
-  // Retries expirados: avança para próxima semana
   await Promise.all((expiredRetries ?? []).map(async expired => {
     console.warn(`[reload] Schedule ${expired.id}: retry expirou sem sucesso.`);
-
     let nextRun: string;
     try { nextRun = nextWeeklyOccurrence(expired.cron_expression); }
     catch {
       await supabase.from("wa_schedules").update({ is_active: false }).eq("id", expired.id);
       return;
     }
-
     await supabase.from("wa_schedules").update({
       next_run_at:         nextRun,
       last_run_at:         nowISO,
@@ -1120,14 +1049,12 @@ async function reloadSchedules(): Promise<void> {
     scheduleTimer(expired.id, nextRun);
   }));
 
-  // Schedules futuros (dentro do lookahead de 2min)
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
       scheduleTimer(s.id, s.next_run_at);
     }
   }
 
-  // Retries pendentes
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as WaSchedule;
     if (
@@ -1148,7 +1075,7 @@ async function reloadSchedules(): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PRE-WARM — conecta todas as contas no boot
+   PRE-WARM
    ───────────────────────────────────────────────────────────────────────────── */
 async function prewarmAccounts(): Promise<void> {
   const { data, error } = await supabase
@@ -1164,7 +1091,8 @@ async function prewarmAccounts(): Promise<void> {
   console.log(`[prewarm] Conectando ${accounts.length} conta(s) WA...`);
 
   await Promise.allSettled(accounts.map(async account => {
-    if (!account.creds_json) {
+    // Pula contas sem creds reais (apenas QR pendente ou nulo)
+    if (!account.creds_json || (account.creds_json as any).qr) {
       console.warn(`[prewarm] ${account.phone_number} sem creds — precisa escanear QR`);
       return;
     }
@@ -1194,7 +1122,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
-  // GET /accounts/:id/groups — lista grupos que a conta está
+  // GET /accounts/:id/groups
   const groupsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/groups$/);
   if (req.method === "GET" && groupsMatch) {
     const account = accountCache.get(groupsMatch[1]);
@@ -1214,7 +1142,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /accounts/:id/reload — recarrega sessão do banco
+  // POST /accounts/:id/reload
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1233,7 +1161,7 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa" });
     }
 
-    // Derruba socket anterior se existir
+    // Derruba socket anterior
     const old = sockets.get(accountId);
     if (old) {
       try { old.end(undefined); } catch {}
@@ -1241,9 +1169,9 @@ const httpServer = http.createServer(async (req, res) => {
       socketReady.set(accountId, false);
     }
 
-    if (!account.creds_json) {
-      // Conta nova sem creds: inicia socket em background para gerar QR.
-      // getSocket() não bloqueia para contas sem creds (ver lógica acima).
+    // FIX v2: conta sem creds reais → inicia em background para gerar QR
+    // Sem esse tratamento, o /reload retornava "skipped" e o QR nunca era gerado
+    if (!account.creds_json || (account.creds_json as any).qr) {
       getSocket(account).catch(err =>
         console.warn(`[reload] Falha ao iniciar QR para ${account.phone_number}: ${err.message}`)
       );
@@ -1260,7 +1188,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /groups/:id/dispatch — disparo manual imediato
+  // POST /groups/:id/dispatch
   const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
   if (req.method === "POST" && dispatchMatch) {
     const groupId = dispatchMatch[1];
@@ -1319,19 +1247,15 @@ httpServer.listen(WORKER_PORT, () => {
    ───────────────────────────────────────────────────────────────────────────── */
 async function shutdown() {
   console.log("[worker-wa] Encerrando...");
-
   for (const t of prefetchTimers.values()) clearTimeout(t);
   for (const t of sniperTimers.values())   clearTimeout(t);
   for (const t of scheduledTimers.values()) clearTimeout(t);
-
   httpServer.close();
-
   await Promise.all([...sockets.entries()].map(async ([id, sock]) => {
     try { sock.end(undefined); } catch {}
     console.log(`[connect] Desconectado: ${id}`);
   }));
   sockets.clear();
-
   process.exit(0);
 }
 process.on("SIGTERM", shutdown);
