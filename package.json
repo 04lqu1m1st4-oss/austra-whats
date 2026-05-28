@@ -14,11 +14,13 @@
     "@whiskeysockets/baileys": "^6.7.9",
     "node-cron": "^3.0.3",
     "pino": "^9.5.0",
+    "qrcode": "^1.5.4",
     "telegram": "^2.19.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/node-cron": "^3.0.11",
+    "@types/qrcode": "^1.5.5",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.0"
   }
