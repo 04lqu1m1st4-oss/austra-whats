@@ -1138,8 +1138,13 @@ const httpServer = http.createServer(async (req, res) => {
   // GET /accounts/:id/groups
   const groupsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/groups$/);
   if (req.method === "GET" && groupsMatch) {
-    const account = accountCache.get(groupsMatch[1]);
+    const accountId = groupsMatch[1];
+    const account = accountCache.get(accountId);
     if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache" });
+
+    if (!socketReady.get(accountId)) {
+      return jsonResponse(res, 503, { error: "Conta não conectada — tente novamente em instantes" });
+    }
 
     try {
       const sock    = await getSocket(account);
