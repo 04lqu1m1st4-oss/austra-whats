@@ -4,8 +4,7 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "start:telegram": "node dist/worker.js",
-    "start:whatsapp": "node dist/worker-whatsapp.js",
+    "start": "node dist/worker-whatsapp.js",
     "dev:telegram": "ts-node worker.ts",
     "dev:whatsapp": "ts-node worker-whatsapp.ts"
   },
