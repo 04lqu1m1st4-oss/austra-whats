@@ -57,7 +57,7 @@ const supabase = createClient(
 const WORKER_PORT              = parseInt(process.env.PORT ?? "3002", 10);
 const WORKER_SECRET            = process.env.WORKER_SECRET ?? "";
 
-const SNIPER_BEFORE_MS              = 380;
+const SNIPER_BEFORE_MS              = 120;
 const SNIPER_SEND_TIMEOUT_MS        = 1_500;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 2;
 const SNIPER_PAUSE_EVERY_N          = 10;
@@ -305,7 +305,7 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
       connectTimeoutMs:    30_000,
       keepAliveIntervalMs: 30_000,
       retryRequestDelayMs: 250,
-      maxMsgRetryCount:    3,
+      maxMsgRetryCount:    0,
       getMessage: async () => undefined,
     });
 
@@ -549,6 +549,24 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const cycleMessageId = randomUUID();
 
     console.log(`[sniper] 🎯 Iniciando loop para schedule ${scheduleId} — ${members.length} conta(s) | cycle: ${cycleMessageId}`);
+
+    // ── DEDUP PRÉ-DISPARO: aborta se qualquer conta já enviou neste ciclo ──
+    const alreadySent = await getAlreadySentIds(schedule);
+    if (alreadySent.size > 0) {
+      console.warn(`[sniper] ⛔ Dedup: ${alreadySent.size} conta(s) já enviaram neste ciclo — abortando sniper para schedule ${scheduleId}`);
+      await updateScheduleAfterDispatch(
+        schedule,
+        members.map(m => ({
+          account_id:   m.wa_accounts!.id,
+          message_text: m.message_text,
+          status:       "skipped" as const,
+          retryable:    false,
+        })),
+        now,
+        cycleMessageId
+      );
+      return;
+    }
 
     // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
     const firstMember  = members[0];
