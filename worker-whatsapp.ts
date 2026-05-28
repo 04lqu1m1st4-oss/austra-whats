@@ -42,6 +42,7 @@ import P                                      from "pino";
 import http                                   from "http";
 import { randomUUID }                         from "crypto";
 import { EventEmitter }                       from "events";
+import QRCode                                 from "qrcode";
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SUPABASE
@@ -350,12 +351,17 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
 
       if (qr) {
         // QR gerado = sessão nova ou expirada
-        // Salva no banco para o frontend exibir
-        console.log(`[connect] QR gerado para ${account.phone_number} — salvar no banco para scan`);
-        await supabase
-          .from("wa_accounts")
-          .update({ creds_json: { qr } })
-          .eq("id", account.id);
+        // Converte string bruta do Baileys para PNG base64 e salva no banco
+        console.log(`[connect] QR gerado para ${account.phone_number} — convertendo para PNG e salvando`);
+        try {
+          const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
+          await supabase
+            .from("wa_accounts")
+            .update({ creds_json: { qr: qrDataUrl } })
+            .eq("id", account.id);
+        } catch (err: any) {
+          console.error(`[connect] Falha ao gerar QR PNG para ${account.phone_number}: ${err.message}`);
+        }
       }
 
       if (connection === "open") {
