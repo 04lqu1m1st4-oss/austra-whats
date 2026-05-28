@@ -57,7 +57,7 @@ const supabase = createClient(
 const WORKER_PORT              = parseInt(process.env.PORT ?? "3002", 10);
 const WORKER_SECRET            = process.env.WORKER_SECRET ?? "";
 
-const SNIPER_BEFORE_MS              = 120;
+const SNIPER_BEFORE_MS              = 380;
 const SNIPER_SEND_TIMEOUT_MS        = 1_500;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 2;
 const SNIPER_PAUSE_EVERY_N          = 10;
