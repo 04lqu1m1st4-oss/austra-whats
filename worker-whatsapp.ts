@@ -159,11 +159,8 @@ const SCHEDULE_SELECT = `
 /* ─────────────────────────────────────────────────────────────────────────────
    HELPERS PUROS
    ───────────────────────────────────────────────────────────────────────────── */
-function isRetryableError(msg: string): boolean {
-  const u = msg.toUpperCase();
-  return !u.includes("LOGGED_OUT") &&
-         !u.includes("BANNED") &&
-         !u.includes("FORBIDDEN");
+function isRetryableError(_msg: string): boolean {
+  return true;
 }
 
 function nextWeeklyOccurrence(cron: string): string {
@@ -599,25 +596,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         break;
 
       } catch (err: any) {
-        const errMsg = String(err?.message ?? "");
-        const isFatal =
-          errMsg.includes("LOGGED_OUT") ||
-          errMsg.includes("BANNED")     ||
-          errMsg.includes("FORBIDDEN");
-
-        if (isFatal) {
-          console.error(`[sniper] Erro fatal em ${firstAccount.phone_number}: ${errMsg}`);
-          results.push({
-            account_id:   firstAccount.id,
-            message_text: firstMember.message_text,
-            status:       "failed",
-            retryable:    false,
-            error:        errMsg,
-          });
-          await updateScheduleAfterDispatch(schedule, results, now, cycleMessageId);
-          return;
-        }
-
         if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
           await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
         } else {
