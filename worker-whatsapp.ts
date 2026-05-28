@@ -596,7 +596,24 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         break;
 
       } catch (err: any) {
-        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+        // se o socket caiu durante o loop, tenta re-adquirir (budget permitting)
+        if (!socketReady.get(firstAccount.id)) {
+          const reacquireDeadline = Math.min(Date.now() + 6_000, budgetEnd - 500);
+          if (Date.now() < reacquireDeadline) {
+            console.warn(`[sniper] Socket caiu durante loop — re-adquirindo (${Math.round((reacquireDeadline - Date.now()) / 1_000)}s)`);
+            try {
+              firstSock = await Promise.race([
+                getSocket(firstAccount),
+                new Promise<never>((_, r) =>
+                  setTimeout(() => r(new Error("REACQUIRE_TIMEOUT")), reacquireDeadline - Date.now())
+                ),
+              ]);
+              console.log(`[sniper] ✓ Socket re-adquirido para ${firstAccount.phone_number}`);
+            } catch (reErr: any) {
+              console.warn(`[sniper] Re-acquire falhou: ${reErr.message}`);
+            }
+          }
+        } else if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
           await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
         } else {
           await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
