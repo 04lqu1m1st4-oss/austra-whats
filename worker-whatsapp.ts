@@ -6,7 +6,7 @@
 //   1. Sessão: Baileys usa creds.json (JSONB no Supabase) em vez de StringSession
 //   2. Dedup: WA não tem randomId nativo — usamos cycle_message_id (UUID por ciclo)
 //             salvo em wa_dispatch_logs ANTES de enviar. Retry verifica no banco.
-//   3. Timing: SNIPER_BEFORE_MS = 120ms (RTT WA ~60-80ms one-way vs ~25ms do Telegram)
+//   3. Timing: SNIPER_BEFORE_MS = 380ms — começa cedo para maximizar tentativas antes do horário.
 //              Calibrar com logs [sniper][timing] após primeiros disparos.
 //   4. Conexão: Baileys emite eventos de estado — sem polling keepalive.
 //               connection.update detecta queda em tempo real.
@@ -27,6 +27,13 @@
 //   getSocket não bloqueia em socketReady para contas sem creds (fix: timeout 30s em novas contas)
 //   /reload inicia QR para contas novas sem creds (fix: retornava skipped sem iniciar sessão)
 //   initAuthCreds importado e usado corretamente na inicialização de sessão
+//
+// v3 (merge velocidade + robustez):
+//   SNIPER_BEFORE_MS = 380 — mais tempo de antecipação = mais tentativas antes do horário (v2-fast)
+//   maxMsgRetryCount = 3 — retry interno do Baileys reativado (v2-fast)
+//   Dedup pré-disparo no sniper restaurado — aborta se alguém já enviou nesse ciclo (v1-robust)
+//   Re-acquire de socket no loop sniper com timeout curto (500ms) e não-bloqueante (v1-robust)
+//   GET /accounts/:id/groups verifica socketReady antes de tentar fetch (v1-robust)
 
 import { createClient }                      from "@supabase/supabase-js";
 import makeWASocket, {
@@ -57,6 +64,9 @@ const supabase = createClient(
 const WORKER_PORT              = parseInt(process.env.PORT ?? "3002", 10);
 const WORKER_SECRET            = process.env.WORKER_SECRET ?? "";
 
+// 380ms de antecipação: começa cedo, tem mais tentativas antes do horário-alvo.
+// Se os logs [sniper][timing] mostrarem vs horário muito negativo (enviou muito cedo),
+// reduza para ~200ms. Se ainda atrasar, aumente para ~500ms.
 const SNIPER_BEFORE_MS              = 380;
 const SNIPER_SEND_TIMEOUT_MS        = 1_500;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 2;
@@ -65,6 +75,9 @@ const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 5;
 const SNIPER_BUDGET_MS              = 50_000;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
+// Timeout para re-acquire de socket durante o loop sniper.
+// Curto o suficiente para não desperdiçar budget, longo o suficiente para reconectar.
+const SNIPER_REACQUIRE_TIMEOUT_MS   = 500;
 
 const PREFETCH_BEFORE_MS        = 800;
 const RELOAD_INTERVAL_MS        = 30_000;
@@ -209,7 +222,7 @@ function isRetryDue(schedule: WaSchedule, now: Date): boolean {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SESSÃO BAILEYS — SUPABASE COMO STORAGE
-   
+
    Estrutura salva em wa_accounts.creds_json:
    {
      creds: { ... },   // credenciais principais
@@ -228,7 +241,6 @@ async function useSupabaseAuthState(account: WaAccount): Promise<SupabaseAuthSta
   const keyStore: Record<string, Record<string, unknown>> = (data.keys as any) ?? {};
 
   const state: AuthenticationState = {
-    // FIX v2: usa initAuthCreds() em vez de {} as any para garantir estrutura correta
     creds: (data.creds as any) ?? initAuthCreds(),
     keys: {
       get: (type: string, ids: string[]) => {
@@ -305,6 +317,8 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
       connectTimeoutMs:    30_000,
       keepAliveIntervalMs: 30_000,
       retryRequestDelayMs: 250,
+      // 3 retries internos do Baileys — ajuda em falhas transitórias de rede
+      // sem custo de budget (são síncronos ao sendMessage)
       maxMsgRetryCount:    3,
       getMessage: async () => undefined,
     });
@@ -318,8 +332,6 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // FIX v2: converte string bruta do Baileys para PNG base64 antes de salvar
-        // O frontend espera data:image/png;base64,... — sem isso a imagem não renderiza
         console.log(`[connect] QR gerado para ${account.phone_number} — convertendo para PNG e salvando`);
         try {
           const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
@@ -364,9 +376,8 @@ async function getSocket(account: WaAccount): Promise<WASocket> {
       }
     });
 
-    // FIX v2: só bloqueia esperando socketReady se a conta JÁ TEM creds salvas.
-    // Contas novas (sem creds) precisam escanear QR primeiro — não há como ficar "ready"
-    // antes do scan, então não esperamos: o socket fica em background gerando o QR.
+    // Só bloqueia esperando socketReady se a conta JÁ TEM creds salvas.
+    // Contas novas (sem creds) precisam escanear QR primeiro.
     if (account.creds_json && !(account.creds_json as any).qr) {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("CONNECT_TIMEOUT_30s")), 30_000);
@@ -401,7 +412,7 @@ async function sendMessage(
   account: WaAccount,
   jid: string,
   messageText: string,
-  cycleMessageId: string
+  _cycleMessageId: string
 ): Promise<void> {
   const budgetEnd = Date.now() + RETRY_BUDGET_MS;
   let attempt = 0;
@@ -550,6 +561,25 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     console.log(`[sniper] 🎯 Iniciando loop para schedule ${scheduleId} — ${members.length} conta(s) | cycle: ${cycleMessageId}`);
 
+    // ── DEDUP PRÉ-DISPARO: aborta se qualquer conta já enviou neste ciclo ──
+    // Protege contra duplo-disparo em caso de restart/retry concorrente.
+    const alreadySent = await getAlreadySentIds(schedule);
+    if (alreadySent.size > 0) {
+      console.warn(`[sniper] ⛔ Dedup: ${alreadySent.size} conta(s) já enviaram neste ciclo — abortando sniper para schedule ${scheduleId}`);
+      await updateScheduleAfterDispatch(
+        schedule,
+        members.map(m => ({
+          account_id:   m.wa_accounts!.id,
+          message_text: m.message_text,
+          status:       "skipped" as const,
+          retryable:    false,
+        })),
+        now,
+        cycleMessageId
+      );
+      return;
+    }
+
     // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
     const firstMember  = members[0];
     const firstAccount = firstMember.wa_accounts!;
@@ -596,7 +626,29 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         break;
 
       } catch (err: any) {
-        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+        // Se o socket caiu, tenta re-adquirir com timeout curto para não desperdiçar budget.
+        // O timeout é propositalmente apertado (SNIPER_REACQUIRE_TIMEOUT_MS = 500ms):
+        // se não reconectar rápido, melhor continuar tentando com o socket atual.
+        if (!socketReady.get(firstAccount.id)) {
+          const reacquireDeadline = Math.min(
+            Date.now() + SNIPER_REACQUIRE_TIMEOUT_MS,
+            budgetEnd - 500
+          );
+          if (Date.now() < reacquireDeadline) {
+            console.warn(`[sniper] Socket caiu durante loop — re-adquirindo (timeout=${SNIPER_REACQUIRE_TIMEOUT_MS}ms)`);
+            try {
+              firstSock = await Promise.race([
+                getSocket(firstAccount),
+                new Promise<never>((_, r) =>
+                  setTimeout(() => r(new Error("REACQUIRE_TIMEOUT")), reacquireDeadline - Date.now())
+                ),
+              ]);
+              console.log(`[sniper] ✓ Socket re-adquirido para ${firstAccount.phone_number}`);
+            } catch (reErr: any) {
+              console.warn(`[sniper] Re-acquire falhou (${reErr.message}) — continuando com socket atual`);
+            }
+          }
+        } else if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
           await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
         } else {
           await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
@@ -750,7 +802,7 @@ async function updateScheduleAfterDispatch(
   schedule: WaSchedule,
   results: DispatchResult[],
   now: Date,
-  cycleMessageId: string
+  _cycleMessageId: string
 ): Promise<void> {
   const nowISO         = now.toISOString();
   const sentCount      = results.filter(r => r.status === "sent").length;
@@ -1069,7 +1121,6 @@ async function prewarmAccounts(): Promise<void> {
   console.log(`[prewarm] Conectando ${accounts.length} conta(s) WA...`);
 
   await Promise.allSettled(accounts.map(async account => {
-    // Pula contas sem creds reais (apenas QR pendente ou nulo)
     if (!account.creds_json || (account.creds_json as any).qr) {
       console.warn(`[prewarm] ${account.phone_number} sem creds — precisa escanear QR`);
       return;
@@ -1103,8 +1154,14 @@ const httpServer = http.createServer(async (req, res) => {
   // GET /accounts/:id/groups
   const groupsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/groups$/);
   if (req.method === "GET" && groupsMatch) {
-    const account = accountCache.get(groupsMatch[1]);
+    const accountId = groupsMatch[1];
+    const account = accountCache.get(accountId);
     if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache" });
+
+    // Checa socketReady antes de tentar — evita fetch pendurado em socket não conectado
+    if (!socketReady.get(accountId)) {
+      return jsonResponse(res, 503, { error: "Conta não conectada — tente novamente em instantes" });
+    }
 
     try {
       const sock    = await getSocket(account);
@@ -1139,7 +1196,6 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa" });
     }
 
-    // Derruba socket anterior
     const old = sockets.get(accountId);
     if (old) {
       try { old.end(undefined); } catch {}
@@ -1147,8 +1203,7 @@ const httpServer = http.createServer(async (req, res) => {
       socketReady.set(accountId, false);
     }
 
-    // FIX v2: conta sem creds reais → inicia em background para gerar QR
-    // Sem esse tratamento, o /reload retornava "skipped" e o QR nunca era gerado
+    // Conta sem creds reais → inicia em background para gerar QR
     if (!account.creds_json || (account.creds_json as any).qr) {
       getSocket(account).catch(err =>
         console.warn(`[reload] Falha ao iniciar QR para ${account.phone_number}: ${err.message}`)
